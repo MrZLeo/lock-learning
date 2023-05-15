@@ -1,10 +1,38 @@
 use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
 
 pub struct SpinLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
+}
+
+pub struct Guard<'a, T> {
+    lock: &'a SpinLock<T>,
+}
+
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        // Safety: The very existence of this Guard
+        // guarantees we've exclusively locked the lock.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Safety: The very existence of this Guard
+        // guarantees we've exclusively locked the lock.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for Guard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Release)
+    }
 }
 
 /// Make SpinLock Sync if T is Send
@@ -18,21 +46,35 @@ impl<T> SpinLock<T> {
         }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    pub fn lock(&self) -> &mut T {
+    pub fn lock(&self) -> Guard<T> {
         while self.locked.swap(true, Acquire) {
             // tells the processor that we're spinning,
             // this hint will result in a special instruction that
             // causes the processor core to optimizeits behavior
             std::hint::spin_loop();
         }
-        unsafe { &mut *self.value.get() }
+        Guard { lock: self }
     }
+}
 
-    /// # Safety
-    /// The &mut T from `lock()` must be gone!
-    /// (And no cheating by keeping reference to fields of that T around!)
-    pub unsafe fn unlock(&self) {
-        self.locked.store(false, Release)
+#[cfg(test)]
+mod test {
+    use std::thread;
+
+    use super::SpinLock;
+
+    #[test]
+    fn spin_lock() {
+        let x = SpinLock::new(Vec::new());
+        thread::scope(|s| {
+            s.spawn(|| x.lock().push(1));
+            s.spawn(|| {
+                let mut g = x.lock();
+                g.push(2);
+                g.push(2);
+            });
+        });
+        let g = x.lock();
+        assert!(g.as_slice() == [1, 2, 2] || g.as_slice() == [2, 2, 1]);
     }
 }
