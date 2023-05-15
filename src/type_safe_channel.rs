@@ -1,10 +1,12 @@
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::{
         AtomicBool,
         Ordering::{Acquire, Relaxed, Release},
     },
+    thread::{self, Thread},
 };
 
 pub struct TypeSafeChannel<T> {
@@ -22,7 +24,16 @@ impl<T> TypeSafeChannel<T> {
 
     pub fn split(&mut self) -> (Sender<T>, Receiver<T>) {
         *self = Self::new();
-        (Sender { channel: self }, Receiver { channel: self })
+        (
+            Sender {
+                channel: self,
+                receving_thread: thread::current(),
+            },
+            Receiver {
+                channel: self,
+                _no_send: PhantomData,
+            },
+        )
     }
 }
 
@@ -40,10 +51,13 @@ unsafe impl<T> Sync for TypeSafeChannel<T> where T: Send {}
 
 pub struct Sender<'a, T> {
     channel: &'a TypeSafeChannel<T>,
+    receving_thread: Thread,
 }
 
 pub struct Receiver<'a, T> {
     channel: &'a TypeSafeChannel<T>,
+    /// Don't allow Receiver to be sent in order to no confused Sender
+    _no_send: PhantomData<*const ()>,
 }
 
 impl<T> Sender<'_, T> {
@@ -52,6 +66,9 @@ impl<T> Sender<'_, T> {
             (*self.channel.message.get()).write(message);
         }
         self.channel.ready.store(true, Release);
+
+        // raise the sleeping thread
+        self.receving_thread.unpark();
     }
 }
 
@@ -61,8 +78,8 @@ impl<T> Receiver<'_, T> {
     }
 
     pub fn receive(self) -> T {
-        if !self.channel.ready.swap(false, Acquire) {
-            panic!("no message available!");
+        while !self.channel.ready.swap(false, Acquire) {
+            thread::park();
         }
         unsafe { (*self.channel.message.get()).assume_init_read() }
     }
@@ -70,6 +87,7 @@ impl<T> Receiver<'_, T> {
 
 #[cfg(test)]
 mod test {
+    #[deny(warnings)]
     use std::thread;
 
     use super::TypeSafeChannel;
@@ -79,14 +97,9 @@ mod test {
         let mut channel = TypeSafeChannel::new();
         thread::scope(|s| {
             let (sender, receiver) = channel.split();
-            let t = thread::current();
             s.spawn(move || {
                 sender.send("hello world!");
-                t.unpark();
             });
-            while !receiver.is_ready() {
-                thread::park();
-            }
             assert_eq!(receiver.receive(), "hello world!");
         });
     }
