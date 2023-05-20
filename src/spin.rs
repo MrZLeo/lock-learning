@@ -8,11 +8,11 @@ pub struct SpinLock<T> {
     value: UnsafeCell<T>,
 }
 
-pub struct Guard<'a, T> {
+pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
-impl<T> Deref for Guard<'_, T> {
+impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         // Safety: The very existence of this Guard
@@ -21,7 +21,7 @@ impl<T> Deref for Guard<'_, T> {
     }
 }
 
-impl<T> DerefMut for Guard<'_, T> {
+impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // Safety: The very existence of this Guard
         // guarantees we've exclusively locked the lock.
@@ -29,7 +29,7 @@ impl<T> DerefMut for Guard<'_, T> {
     }
 }
 
-impl<T> Drop for Guard<'_, T> {
+impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Release)
     }
@@ -46,14 +46,14 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn lock(&self) -> Guard<T> {
+    pub fn lock(&self) -> SpinGuard<T> {
         while self.locked.swap(true, Acquire) {
             // tells the processor that we're spinning,
             // this hint will result in a special instruction that
             // causes the processor core to optimizeits behavior
             std::hint::spin_loop();
         }
-        Guard { lock: self }
+        SpinGuard { lock: self }
     }
 }
 
