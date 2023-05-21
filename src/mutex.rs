@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::atomic::{
         AtomicU32,
-        Ordering::{Acquire, Release},
+        Ordering::{Acquire, Relaxed, Release},
     },
 };
 
@@ -12,7 +12,8 @@ use atomic_wait::{wait, wake_one};
 pub struct Mutex<T> {
     /// State to indicate Lock:
     /// - 0: unlocked
-    /// - 1: locked
+    /// - 1: locked, no other threads waiting
+    /// - 2: locked, other threads waiting
     state: AtomicU32,
     value: UnsafeCell<T>,
 }
@@ -45,11 +46,27 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<T> {
-        // Set the state to 1
-        while self.state.swap(1, Acquire) == 1 {
-            // If it was already locked,
-            // then wait unless the state is on longer 1
-            wait(&self.state, 1);
+        // compare_exchange from 0 to 1:
+        // - if success, then state is actually 0(unlocked), get the lock
+        // - else, state is 1 or 2 (locked).
+        //
+        // In that situation, swap 2 into state:
+        //  - if state is 1, then it move to 2 now
+        //  - if state is 2, nothing happen
+        //
+        // After swap, wait for state become not 2, and check again,
+        // - if state is 0, then we got the locked and move state to 2?
+        // - if state is not 0, means other thread got the lock before
+        //
+        // INFO: We don't know actual number of threads that are waiting,
+        // so if one thread get into state 2, then once it get a 0,
+        // state needs to become 2 to avoid lost of wait().
+        // But if we don't have thread get into state 2, then it's safe
+        // to just avoid wait() and wake_one()
+        if self.state.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
+            while self.state.swap(2, Acquire) != 0 {
+                wait(&self.state, 2);
+            }
         }
         MutexGuard { mutex: self }
     }
@@ -57,10 +74,9 @@ impl<T> Mutex<T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        // Set the state back to 0
-        self.mutex.state.store(0, Release);
-
         // Wake up one of the waiting threads, if any.
-        wake_one(&self.mutex.state);
+        if self.mutex.state.swap(0, Release) == 2 {
+            wake_one(&self.mutex.state);
+        }
     }
 }
